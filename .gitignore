@@ -1,0 +1,7 @@
+.idea
+a.out
+compile_commands.json
+cmake-build-*/
+build/
+.clang-format
+CMakeLists.txt
