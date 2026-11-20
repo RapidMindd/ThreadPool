@@ -4,9 +4,18 @@
 #include <thread>
 #include <vector>
 
-constexpr int THREADS_COUNT = 8;
-constexpr int BATCH_SIZE = 10'000;
-constexpr int TASKS_COUNT = 1'000'000;
+constexpr int THREADS_COUNT = 16;
+constexpr int BATCH_SIZE = 10;
+constexpr int TASKS_COUNT = 500;
+constexpr bool STEALING_ENABLED = true;
+
+size_t fib(size_t n)
+{
+  if (n <= 1) {
+    return n;
+  }
+  return fib(n - 1) + fib(n - 2);
+}
 
 struct task_t
 {
@@ -20,14 +29,17 @@ struct task_t
 struct th_pool_t
 {
   using f_t = std::function< void(void) >;
-  explicit th_pool_t(size_t count);
+  explicit th_pool_t(size_t count, bool stealing_switch = true);
   ~th_pool_t();
   void submit(f_t f);
   void pause();
   void resume();
   void wait();
 private:
-  void execute();
+  void execute(size_t thread_id);
+  std::vector< std::queue< f_t > > local_queues_;
+  bool has_tasks();
+  bool stealing_enabled_;
   std::queue< f_t > tasks_;
   std::mutex mutex_;
   std::condition_variable cv_;
@@ -43,7 +55,7 @@ void th_pool_t::wait()
   std::unique_lock lck(mutex_);
   auto proceed = [this]
   {
-    return tasks_.empty() && active == 0;
+    return !has_tasks() && active == 0;
   };
   wait_cv_.wait(lck, proceed);
 }
@@ -72,15 +84,30 @@ void th_pool_t::submit(f_t f)
   cv_.notify_one();
 }
 
-th_pool_t::th_pool_t(size_t count)
+th_pool_t::th_pool_t(size_t count, bool stealing_switch):
+  local_queues_(count),
+  stealing_enabled_(stealing_switch)
 {
-  auto lambda = [this]()
-  {
-    execute();
-  };
   for (size_t i = 0; i < count; ++i) {
-    threads_.emplace_back(lambda);
+    threads_.emplace_back(
+        [this, i]
+        {
+          execute(i);
+        });
   }
+}
+
+bool th_pool_t::has_tasks()
+{
+  if (!tasks_.empty()) {
+    return true;
+  }
+  for (const auto& queue: local_queues_) {
+    if (!queue.empty()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 th_pool_t::~th_pool_t()
@@ -94,39 +121,62 @@ th_pool_t::~th_pool_t()
   }
 }
 
-void th_pool_t::execute()
+void th_pool_t::execute(size_t thread_id)
 {
-  std::queue< f_t > local_tasks;
   std::unique_lock lck(mutex_);
+  auto& local_tasks = local_queues_[thread_id];
   do {
     auto proceed = [&]
     {
-      return stop_ || (!paused_ && !tasks_.empty());
+      bool available = !local_tasks.empty() || !tasks_.empty();
+      if (stealing_enabled_) {
+        available = has_tasks();
+      }
+      return stop_ || (!paused_ && available);
     };
     cv_.wait(lck, proceed);
-    if (tasks_.empty()) {
+    if (!has_tasks()) {
       continue;
     }
-    for (size_t i = 0; i < BATCH_SIZE && !tasks_.empty(); ++i) {
-      local_tasks.push(std::move(tasks_.front()));
-      tasks_.pop();
+    if (local_tasks.empty()) {
+      for (size_t i = 0; i < BATCH_SIZE && !tasks_.empty(); ++i) {
+        local_tasks.push(std::move(tasks_.front()));
+        tasks_.pop();
+      }
+      cv_.notify_all();
+    }
+    if (stealing_enabled_ && local_tasks.empty()) {
+      for (size_t i = 0; i < local_queues_.size(); ++i) {
+        if (i == thread_id) {
+          continue;
+        }
+        auto& queue = local_queues_[i];
+        if (!queue.empty()) {
+          size_t count = queue.size() / 2 + queue.size() % 2;
+          for (size_t j = 0; j < count; ++j) {
+            local_tasks.push(std::move(queue.front()));
+            queue.pop();
+          }
+          break;
+        }
+      }
     }
     ++active;
-    lck.unlock();
     while (!local_tasks.empty()) {
       auto task = std::move(local_tasks.front());
       local_tasks.pop();
+      lck.unlock();
       try {
         task();
       } catch (...) {
       }
+      lck.lock();
     }
-    lck.lock();
     --active;
-    if (tasks_.empty() && active == 0) {
+    if (!has_tasks() && active == 0) {
       wait_cv_.notify_all();
     }
-  } while (!stop_ || !tasks_.empty());
+  } while (!stop_ || has_tasks());
 }
 
 int main()
@@ -136,24 +186,15 @@ int main()
   {
     return [n, index, &results]()
     {
-      if (n <= 1) {
-        results[index] = n;
-        return;
-      }
-      size_t a = 0, b = 1;
-      for (size_t i = 2; i <= n; ++i) {
-        size_t c = a + b;
-        a = b;
-        b = c;
-      }
-      results[index] = b;
+      results[index] = fib(n);
     };
   };
   std::cout << "started\n";
-  th_pool_t pool(THREADS_COUNT);
+  th_pool_t pool(THREADS_COUNT, STEALING_ENABLED);
   pool.pause();
-  for (size_t i = 1; i < TASKS_COUNT; ++i) {
-    pool.submit(make_fib((i * 10 + i) % 90, i));
+  for (size_t i = 0; i < TASKS_COUNT; ++i) {
+    size_t n = i < BATCH_SIZE ? 40 : 20;
+    pool.submit(make_fib(n, i));
   }
   const auto start = std::chrono::steady_clock::now();
   pool.resume();
