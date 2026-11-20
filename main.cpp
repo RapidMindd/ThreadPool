@@ -1,5 +1,12 @@
+#include <chrono>
 #include <iostream>
+#include <numeric>
 #include <thread>
+#include <vector>
+
+constexpr int THREADS_COUNT = 8;
+constexpr int BATCH_SIZE = 10'000;
+constexpr int TASKS_COUNT = 1'000'000;
 
 struct task_t
 {
@@ -89,6 +96,7 @@ th_pool_t::~th_pool_t()
 
 void th_pool_t::execute()
 {
+  std::queue< f_t > local_tasks;
   std::unique_lock lck(mutex_);
   do {
     auto proceed = [&]
@@ -99,13 +107,19 @@ void th_pool_t::execute()
     if (tasks_.empty()) {
       continue;
     }
-    auto task = std::move(tasks_.front());
-    tasks_.pop();
+    for (size_t i = 0; i < BATCH_SIZE && !tasks_.empty(); ++i) {
+      local_tasks.push(std::move(tasks_.front()));
+      tasks_.pop();
+    }
     ++active;
     lck.unlock();
-    try {
-      task();
-    } catch (...) {
+    while (!local_tasks.empty()) {
+      auto task = std::move(local_tasks.front());
+      local_tasks.pop();
+      try {
+        task();
+      } catch (...) {
+      }
     }
     lck.lock();
     --active;
@@ -117,14 +131,36 @@ void th_pool_t::execute()
 
 int main()
 {
+  std::vector< size_t > results(TASKS_COUNT);
+  auto make_fib = [&results](size_t n, size_t index)
+  {
+    return [n, index, &results]()
+    {
+      if (n <= 1) {
+        results[index] = n;
+        return;
+      }
+      size_t a = 0, b = 1;
+      for (size_t i = 2; i <= n; ++i) {
+        size_t c = a + b;
+        a = b;
+        b = c;
+      }
+      results[index] = b;
+    };
+  };
   std::cout << "started\n";
-  th_pool_t pool(4);
+  th_pool_t pool(THREADS_COUNT);
   pool.pause();
-  for (int i = 0; i < 10; ++i) {
-    pool.submit(task_t{});
+  for (size_t i = 1; i < TASKS_COUNT; ++i) {
+    pool.submit(make_fib((i * 10 + i) % 90, i));
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  const auto start = std::chrono::steady_clock::now();
   pool.resume();
   pool.wait();
+  const auto end = std::chrono::steady_clock::now();
+  const auto duration = std::chrono::duration_cast< std::chrono::milliseconds >(end - start);
   std::cout << "finished\n";
+  std::cout << std::accumulate(results.begin(), results.end(), size_t(0)) << '\n';
+  std::cout << duration.count() << '\n';
 }
