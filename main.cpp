@@ -3,6 +3,7 @@
 #include <numeric>
 #include <thread>
 #include <vector>
+#include <pthread.h>
 
 constexpr int THREADS_COUNT = 16;
 constexpr int BATCH_SIZE = 10;
@@ -38,6 +39,7 @@ struct th_pool_t
 private:
   void execute(size_t thread_id);
   std::vector< std::queue< f_t > > local_queues_;
+  std::vector< pthread_rwlock_t > local_queue_mutexes_;
   bool has_tasks();
   bool stealing_enabled_;
   std::queue< f_t > tasks_;
@@ -86,8 +88,12 @@ void th_pool_t::submit(f_t f)
 
 th_pool_t::th_pool_t(size_t count, bool stealing_switch):
   local_queues_(count),
+  local_queue_mutexes_(count),
   stealing_enabled_(stealing_switch)
 {
+  for (auto& lock: local_queue_mutexes_) {
+    pthread_rwlock_init(&lock, nullptr);
+  }
   for (size_t i = 0; i < count; ++i) {
     threads_.emplace_back(
         [this, i]
@@ -119,12 +125,16 @@ th_pool_t::~th_pool_t()
   for (auto&& thread: threads_) {
     thread.join();
   }
+  for (auto& lock: local_queue_mutexes_) {
+    pthread_rwlock_destroy(&lock);
+  }
 }
 
 void th_pool_t::execute(size_t thread_id)
 {
   std::unique_lock lck(mutex_);
   auto& local_tasks = local_queues_[thread_id];
+  auto& local_mutex = local_queue_mutexes_[thread_id];
   do {
     auto proceed = [&]
     {
@@ -139,11 +149,13 @@ void th_pool_t::execute(size_t thread_id)
       continue;
     }
     if (local_tasks.empty()) {
+      pthread_rwlock_wrlock(&local_mutex);
       for (size_t i = 0; i < BATCH_SIZE && !tasks_.empty(); ++i) {
         local_tasks.push(std::move(tasks_.front()));
         tasks_.pop();
       }
       cv_.notify_all();
+      pthread_rwlock_unlock(&local_mutex);
     }
     if (stealing_enabled_ && local_tasks.empty()) {
       for (size_t i = 0; i < local_queues_.size(); ++i) {
@@ -151,20 +163,42 @@ void th_pool_t::execute(size_t thread_id)
           continue;
         }
         auto& queue = local_queues_[i];
+        auto& queue_mutex = local_queue_mutexes_[i];
+        lck.unlock();
+        pthread_rwlock_rdlock(&queue_mutex);
+        bool available = !queue.empty();
+        pthread_rwlock_unlock(&queue_mutex);
+        lck.lock();
+        if (paused_ && !stop_) {
+          break;
+        }
+        if (!available) {
+          continue;
+        }
+        pthread_rwlock_wrlock(&queue_mutex);
         if (!queue.empty()) {
+          pthread_rwlock_wrlock(&local_mutex);
           size_t count = queue.size() / 2 + queue.size() % 2;
           for (size_t j = 0; j < count; ++j) {
             local_tasks.push(std::move(queue.front()));
             queue.pop();
           }
+          pthread_rwlock_unlock(&local_mutex);
+          pthread_rwlock_unlock(&queue_mutex);
           break;
         }
+        pthread_rwlock_unlock(&queue_mutex);
+      }
+      if (local_tasks.empty()) {
+        continue;
       }
     }
     ++active;
     while (!local_tasks.empty()) {
+      pthread_rwlock_wrlock(&local_mutex);
       auto task = std::move(local_tasks.front());
       local_tasks.pop();
+      pthread_rwlock_unlock(&local_mutex);
       lck.unlock();
       try {
         task();
